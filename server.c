@@ -2,6 +2,12 @@
 #include "request.h"
 #include <pthread.h>
 
+#if 0
+#define my_printf(str, ...) \
+  printf(str, ##__VA_ARGS__)
+#else
+#define my_printf(str, ...)
+#endif
 //
 // server.c: A very, very simple web server
 //
@@ -12,14 +18,15 @@
 // Most of the work is done within routines written in request.c
 //
 
+
 // CS537: Parse the new arguments too
 typedef struct connection_information {
   int conn_fd; // connection file descriptor.
-  int in_use;
+  int filled;
+  int issued; // has been given to any thread for consumption ?
 } conn_info_t;
 
 typedef struct shared_buffer {
-  pthread_mutex_t lock;
   conn_info_t *buffer;
   int fill_count;
 } shared_buf_t;
@@ -33,55 +40,59 @@ pthread_cond_t full, empty;
 
 int put_buffer() {
   int i = 0, index = -1;
-  pthread_mutex_lock(&shared_buffer.lock);
     for (i = 0; i < n_buffers; ++i) {
-        if (shared_buffer.buffer[i].in_use == 0) {
-          shared_buffer.buffer[i].in_use = 1;
+        if (shared_buffer.buffer[i].filled == 0) {
+          shared_buffer.buffer[i].filled = 1;
           shared_buffer.fill_count++;
           index = i;
           break;
         }
     }
-  pthread_mutex_unlock(&shared_buffer.lock);
   return index;
 }
 
 int get_buffer() {
   int index = -1, i = 0;
-  pthread_mutex_lock(&shared_buffer.lock);
     for (i = 0; i < n_buffers; ++i) {
-        if (shared_buffer.buffer[i].in_use == 1) {
-          shared_buffer.buffer[i].in_use = 0;
-          shared_buffer.fill_count--;
+        if (shared_buffer.buffer[i].filled == 1 &&
+        shared_buffer.buffer[i].issued == 0 ) {
+          shared_buffer.buffer[i].issued = 1;
           index = i;
           break;
         }
     }
-  pthread_mutex_unlock(&shared_buffer.lock);
   return index;
 }
 
+void free_buffer(int i) {
+      shared_buffer.buffer[i].issued = 0;
+      shared_buffer.buffer[i].filled = 0;
+      shared_buffer.fill_count--;
+}
+
 void* connection_consumer(void *arg) {
-  int i = 0;
   while (1) {
+    int i = 0;
+    int connfd = -1;
     pthread_mutex_lock(&main_lock);
     {
       while (shared_buffer.fill_count == 0) {
         pthread_cond_wait(&full, &main_lock);
       }
       i = get_buffer();
-
+      connfd = shared_buffer.buffer[i].conn_fd;
+      if (i == -1) {
+        perror("Invalid state of Producer-Consumer relationship ! i = -1");
+        exit(1);
+      }
+      my_printf("Thread %p consumed buffer %d\n", arg, i);
+      free_buffer(i);
       pthread_cond_signal(&empty);
     }
     pthread_mutex_unlock(&main_lock);
-
-    if (i == -1) {
-      perror("Invalid state of Producer-Consumer relationship ! i = -1");
-      exit(1);
-    }
-    printf("Thread %p consumed buffer %d\n", arg, i);
-    requestHandle(shared_buffer.buffer[i].conn_fd);
-    Close(shared_buffer.buffer[i].conn_fd);
+      
+    requestHandle(connfd);
+    Close(connfd);
   }
 }
 
@@ -115,26 +126,28 @@ int main(int argc, char *argv[])
     pthread_mutex_init(&main_lock, NULL);
 
     cnsmr_threads = (pthread_t **) malloc(sizeof(pthread_t *) * n_threads);
-    if (!cnsmr_threads) {
+    if (cnsmr_threads == 0) {
       goto exit;
     }
 
     shared_buffer.buffer = (conn_info_t *)
       malloc(sizeof(conn_info_t) * n_buffers);
-    if (!shared_buffer.buffer)
+    if (shared_buffer.buffer == NULL) {
+      perror("goto buffer_error\n");
       goto buffer_error;
+    }
 
-    pthread_mutex_init(&shared_buffer.lock, NULL);
     for (i = 0; i < n_buffers; ++i) {
       shared_buffer.buffer[i].conn_fd = -1;
-      shared_buffer.buffer[i].in_use = 0;
+      shared_buffer.buffer[i].filled = 0;
     }
 
     for (i = 0; i < n_threads; ++i) {
       cnsmr_threads[i] = (pthread_t *) malloc(sizeof(pthread_t));
-      if (!cnsmr_threads[i]) {
-        pthread_create(cnsmr_threads[i], NULL, connection_consumer, (void *) i);
+      if (cnsmr_threads[i]) {
+        pthread_create(cnsmr_threads[i], NULL, connection_consumer, NULL);
       } else {
+        perror("goto free_cnsmr_threads\n");
         goto free_cnsmr_threads;
       }
     }
@@ -158,12 +171,12 @@ int main(int argc, char *argv[])
         }
         i = put_buffer();
         if (i == -1) {
-          perror("Invalid state of Producer-Consumer relationship ! i = %d\n");
+          perror("Invalid state of Producer-Consumer relationship ! i = -1\n");
           exit(1);
         }
 
         shared_buffer.buffer[i].conn_fd = connfd;
-        printf("main Thread produced buffer %d\n", i);
+        my_printf("main Thread produced buffer %d\n", i);
         
         pthread_cond_signal(&full);
       }
